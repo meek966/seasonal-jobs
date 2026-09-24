@@ -162,12 +162,16 @@ def record_to_row(rec):
         "applicationURL", "applyUrl", "websiteUrl"
     ]))
 
-    # Determine visa from case number and available form/application fields.
+    # Determine visa. DOL case numbers look like H-300-25123-456789 (H-2A)
+    # and H-400-25123-456789 (H-2B), so the "H-2A" text is often NOT in them.
     all_text = " ".join(str(v) for v in f.values()).upper()
-    if "H-2B" in case_no.upper() or "9142B" in all_text or "H2B" in all_text:
+    cn = case_no.upper()
+    if cn.startswith("H-400") or "H-2B" in cn or "9142B" in all_text or "H2B" in all_text:
         visa = "H-2B"
+    elif cn.startswith("H-300") or "H-2A" in cn or "790A" in all_text or "9142A" in all_text or "H2A" in all_text:
+        visa = "H-2A"
     else:
-        visa = "H-2A" if ("H-2A" in case_no.upper() or "790A" in all_text or "9142A" in all_text or "H2A" in all_text) else ""
+        visa = ""
 
     job_url = f"{SITE_BASE}/jobs/{quote(case_no)}" if case_no else ""
 
@@ -226,12 +230,12 @@ st.caption("Searches the U.S. Department of Labor SeasonalJobs.gov data feeds an
 
 with st.sidebar:
     st.header("Filters")
-    visa_filter = st.multiselect("Visa program", ["H-2A", "H-2B"], default=["H-2A"])
+    visa_filter = st.multiselect("Visa program", ["H-2A", "H-2B", "Unknown"], default=["H-2A", "H-2B", "Unknown"])
     keyword = st.text_input("Keyword", placeholder="farmworker, harvest, construction…")
     state_filter = st.text_input("State", placeholder="TX, WA, Idaho…")
     min_wage = st.number_input("Minimum hourly wage ($)", min_value=0.0, value=0.0, step=0.50)
     only_activeish = st.checkbox("Prefer jobs with future end dates", value=True)
-    need_contact = st.checkbox("Only show jobs with email or phone", value=True)
+    need_contact = st.checkbox("Only show jobs with email or phone", value=False)
 
     st.divider()
     st.markdown("**Data source**")
@@ -253,6 +257,7 @@ if st.session_state.df is None:
             df = make_dataframe(records)
             st.session_state.df = df
             st.session_state.feed_info = (used_date, url, filename, len(records))
+            st.session_state.sample_keys = list(flatten(records[0]).keys())[:80] if records else []
         except Exception as e:
             st.error("The DOL feed could not be loaded.")
             st.code(str(e))
@@ -262,8 +267,10 @@ df = st.session_state.df.copy()
 used_date, feed_url, filename, raw_count = st.session_state.feed_info
 
 # Enrich missing recruitment contacts lazily only for displayed rows.
+stages = [("Records read from feed", raw_count), ("Rows after cleaning", len(df))]
 if visa_filter:
-    df = df[df["Visa"].isin(visa_filter)]
+    df = df[df["Visa"].replace("", "Unknown").isin(visa_filter)]
+stages.append(("After visa filter", len(df)))
 
 if keyword:
     q = keyword.lower()
@@ -272,21 +279,37 @@ if keyword:
         | df["Employer"].str.lower().str.contains(q, na=False)
     )
     df = df[mask]
+stages.append(("After keyword filter", len(df)))
 
 if state_filter:
     df = df[df["State"].str.lower().str.contains(state_filter.lower(), na=False)]
 
+stages.append(("After state filter", len(df)))
 df["WageNumeric"] = df["Wage"].map(parse_wage)
 if min_wage > 0:
     df = df[df["WageNumeric"].fillna(-1) >= min_wage]
 
+stages.append(("After wage filter", len(df)))
 if only_activeish:
     today = pd.Timestamp.today().normalize()
     parsed_end = pd.to_datetime(df["End"], errors="coerce")
     df = df[parsed_end.isna() | (parsed_end >= today)]
 
+stages.append(("After end-date filter", len(df)))
 if need_contact:
     df = df[(df["Application email"] != "") | (df["Application phone"] != "")]
+stages.append(("After contact filter", len(df)))
+
+with st.expander("🛠 Debug: why so few / zero jobs?"):
+    for name, n in stages:
+        st.write(f"{name}: **{n:,}**")
+    full = st.session_state.df
+    st.write("Visa values found in feed:", full["Visa"].replace("", "Unknown").value_counts().to_dict())
+    st.write("Rows with email:", int((full["Application email"] != "").sum()),
+             "| with phone:", int((full["Application phone"] != "").sum()))
+    st.write("Sample field names in the first feed record:")
+    st.code("\n".join(st.session_state.get("sample_keys", [])))
+    st.dataframe(full.head(5))
 
 df = df.sort_values(["WageNumeric", "Start"], ascending=[False, True], na_position="last")
 
