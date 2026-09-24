@@ -1,4 +1,3 @@
-
 import io, json, re, zipfile
 from datetime import date, timedelta
 from urllib.parse import quote
@@ -15,42 +14,47 @@ st.set_page_config(
 
 FEED_BASE = "https://api.seasonaljobs.dol.gov/datahub-search/sjCaseData/zip"
 SITE_BASE = "https://seasonaljobs.dol.gov"
-TIMEOUT = 45
+TIMEOUT = 60
 
-@st.cache_data(ttl=6*60*60, show_spinner=False)
+# DOL publishes three feeds. "jo" = 790/790A (H-2A farm job orders),
+# "h2a" = 9142A (H-2A applications), "h2b" = 9142B (H-2B non-farm: construction,
+# landscaping, hospitality, etc.). H-2B jobs are ONLY in the "h2b" feed.
+FEEDS = {"jo": "H-2A", "h2a": "H-2A", "h2b": "H-2B"}
+
+
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
 def download_feed(feed_kind: str, feed_date: str):
     url = f"{FEED_BASE}/{feed_kind}/{feed_date}"
     r = requests.get(url, timeout=TIMEOUT)
     r.raise_for_status()
     return r.content, url
 
-def previous_working_feed_date():
-    # The DOL feed is daily; try today and the preceding few dates.
-    d = date.today()
-    return [d - timedelta(days=i) for i in range(0, 8)]
 
-def load_latest_feed(kind="jo"):
+def load_latest_feed(kind):
     errors = []
-    for d in previous_working_feed_date():
+    today = date.today()
+    for i in range(0, 8):
+        d = today - timedelta(days=i)
         try:
             content, url = download_feed(kind, d.isoformat())
             return content, url, d.isoformat()
         except Exception as e:
             errors.append(f"{d.isoformat()}: {e}")
-    raise RuntimeError("Could not download a recent DOL feed.\n" + "\n".join(errors))
+    raise RuntimeError(f"Could not download the '{kind}' feed.\n" + "\n".join(errors))
+
 
 def find_json_objects(obj):
     if isinstance(obj, list):
         for x in obj:
             yield x
     elif isinstance(obj, dict):
-        # Some feeds may wrap records in a top-level key.
-        for key in ("data", "results", "jobs", "records", "items", "jobOrders"):
+        for key in ("data", "results", "jobs", "records", "items", "jobOrders", "cases"):
             if key in obj and isinstance(obj[key], list):
                 for x in obj[key]:
                     yield x
                 return
         yield obj
+
 
 def parse_zip_json(content: bytes):
     with zipfile.ZipFile(io.BytesIO(content)) as z:
@@ -58,15 +62,19 @@ def parse_zip_json(content: bytes):
         json_names = [n for n in names if n.lower().endswith(".json")]
         if not json_names:
             raise ValueError(f"No JSON file found in feed archive. Files: {names[:10]}")
-        # Prefer the largest JSON file; feeds sometimes include metadata files.
         name = max(json_names, key=lambda n: z.getinfo(n).file_size)
         raw = z.read(name).decode("utf-8-sig")
-    data = json.loads(raw)
-    records = list(find_json_objects(data))
-    return records, name
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        # Some feeds are one JSON object per line.
+        data = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    return list(find_json_objects(data)), name
+
 
 def norm(s):
     return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
 
 def flatten(obj, prefix=""):
     out = {}
@@ -82,36 +90,58 @@ def flatten(obj, prefix=""):
             out.update(flatten(v, f"{prefix}.{i}"))
     return out
 
+
+def _empty(v):
+    return v is None or (isinstance(v, str) and not v.strip())
+
+
 def first_value(flat, aliases):
     aliases = [norm(a) for a in aliases]
-    # exact key match first
     for a in aliases:
         for k, v in flat.items():
-            if k == a and v not in (None, ""):
+            if k == a and not _empty(v):
                 return v
-    # then suffix match
     for a in aliases:
         for k, v in flat.items():
-            if k.endswith(a) and v not in (None, ""):
+            if k.endswith(a) and not _empty(v):
                 return v
     return ""
 
+
+def pick(flat, aliases, fuzzy=(), exclude=()):
+    """Try known names first, then fall back to any field whose name contains
+    all the given words (names are lower-case letters/digits only)."""
+    v = first_value(flat, aliases)
+    if not _empty(v):
+        return v
+    for words in fuzzy:
+        for k, val in flat.items():
+            if _empty(val):
+                continue
+            if all(w in k for w in words) and not any(x in k for x in exclude):
+                return val
+    return ""
+
+
 def normalize_case_number(v):
     """DOL job pages use the ETA case number, e.g. H-300-26265-251804.
-    The feed may give a job-order number like JO-A-300-26265-251804,
-    which the website says 'case not found' for. Rebuild the H- form."""
+    Job-order numbers look like JO-A-300-26265-251804 and give 'case not found'
+    on the website, so rebuild the H- form."""
     s = str(v or "").strip()
     m = re.search(r"(\d{3})-(\d{5})-(\d{6})", s)
     return f"H-{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else s
+
 
 def clean_phone(v):
     s = str(v or "").strip()
     return re.sub(r"[^0-9+(). extx-]", "", s)
 
+
 def clean_email(v):
     s = str(v or "").strip()
     m = re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", s, re.I)
     return m.group(0) if m else ""
+
 
 def clean_url(v):
     s = str(v or "").strip()
@@ -119,63 +149,94 @@ def clean_url(v):
         return "https://" + s
     return s
 
-def record_to_row(rec):
+
+def record_to_row(rec, kind):
     f = flatten(rec)
 
-    case_no = normalize_case_number(first_value(f, [
-        "caseNumber", "caseNo", "caseID", "caseId", "jobOrderCaseNumber",
-        "h2aCaseNumber", "h2bCaseNumber"
-    ]))
+    case_no = normalize_case_number(pick(
+        f,
+        ["caseNumber", "caseNo", "caseID", "caseId", "jobOrderCaseNumber",
+         "jobOrderNumber", "h2aCaseNumber", "h2bCaseNumber"],
+        fuzzy=[("casenumber",), ("jobordernumber",), ("caseno",)],
+    ))
+    if not case_no.startswith("H-"):
+        for v in f.values():
+            if re.search(r"\d{3}-\d{5}-\d{6}", str(v)):
+                case_no = normalize_case_number(v)
+                break
 
-    title = first_value(f, [
-        "jobTitle", "occupationTitle", "jobOrderTitle", "occupation",
-        "socOccupationalTitle"
-    ])
+    title = pick(
+        f,
+        ["jobTitle", "occupationTitle", "jobOrderTitle", "occupation", "socOccupationalTitle"],
+        fuzzy=[("jobtitle",), ("occupation", "title"), ("title",)],
+        exclude=("soc",),
+    )
+    employer = pick(
+        f,
+        ["employerName", "employerLegalName", "businessName",
+         "employerBusinessName", "companyName", "legalBusinessName"],
+        fuzzy=[("employer", "name"), ("business", "name"), ("legal", "name")],
+        exclude=("contact", "agent", "attorney", "preparer"),
+    )
+    city = pick(
+        f, ["city", "worksiteCity", "placeOfEmploymentCity"],
+        fuzzy=[("worksite", "city"), ("city",)],
+    )
+    state = pick(
+        f, ["state", "stateCode", "worksiteState", "placeOfEmploymentState"],
+        fuzzy=[("worksite", "state"), ("state",)],
+        exclude=("statement", "status"),
+    )
+    wage = pick(
+        f, ["wageRate", "offeredWage", "wage", "payRate", "hourlyWage", "wageAmount",
+            "basicRate", "basicRateFrom"],
+        fuzzy=[("wage",), ("payrate",), ("basicrate",)],
+    )
+    start = pick(
+        f, ["beginDate", "startDate", "workStartDate", "firstDateOfWork", "employmentBeginDate"],
+        fuzzy=[("begin", "date"), ("start", "date")],
+    )
+    end = pick(
+        f, ["endDate", "workEndDate", "lastDateOfWork", "employmentEndDate"],
+        fuzzy=[("end", "date")],
+    )
+    workers = pick(
+        f, ["numberOfWorkersRequested", "workersRequested", "totalWorkers", "numberWorkers",
+            "totalWorkersNeeded"],
+        fuzzy=[("workers", "needed"), ("workers", "requested"), ("number", "workers"), ("workers",)],
+    )
+    email = clean_email(pick(
+        f, ["emailAddressToApply", "emailToApply", "applicationEmail", "recruitmentEmail",
+            "employerEmail", "businessEmailAddress", "emailAddress"],
+        fuzzy=[("email",)],
+    ))
+    if not email:
+        for v in f.values():
+            e = clean_email(v) if isinstance(v, str) else ""
+            if e:
+                email = e
+                break
+    phone = clean_phone(pick(
+        f, ["telephoneNumberToApply", "phoneNumberToApply", "applicationPhone",
+            "recruitmentPhone", "employerPhone", "telephoneNumber", "phoneNumber", "telephone"],
+        fuzzy=[("phone",), ("telephone",)],
+        exclude=("fax",),
+    ))
+    apply_url = clean_url(pick(
+        f, ["websiteAddressToApply", "webAddressToApply", "applicationUrl", "applicationURL",
+            "applyUrl", "websiteUrl"],
+        fuzzy=[("website",), ("url",)],
+    ))
 
-    employer = first_value(f, [
-        "employerName", "employerLegalName", "businessName",
-        "employerBusinessName", "companyName"
-    ])
+    # Visa comes from WHICH FEED the record was in (most reliable), then the case number.
+    visa = FEEDS.get(kind, "")
+    if not visa:
+        if case_no.startswith("H-400"):
+            visa = "H-2B"
+        elif case_no.startswith("H-300"):
+            visa = "H-2A"
 
-    city = first_value(f, ["city", "worksiteCity", "placeOfEmploymentCity"])
-    state = first_value(f, ["state", "stateCode", "worksiteState", "placeOfEmploymentState"])
-    wage = first_value(f, [
-        "wageRate", "offeredWage", "wage", "payRate", "hourlyWage",
-        "wageAmount"
-    ])
-    start = first_value(f, ["beginDate", "startDate", "workStartDate", "firstDateOfWork"])
-    end = first_value(f, ["endDate", "workEndDate", "lastDateOfWork"])
-    workers = first_value(f, [
-        "numberOfWorkersRequested", "workersRequested", "totalWorkers",
-        "numberWorkers"
-    ])
-    email = clean_email(first_value(f, [
-        "emailAddressToApply", "emailToApply", "applicationEmail",
-        "recruitmentEmail", "employerEmail", "businessEmailAddress",
-        "emailAddress"
-    ]))
-    phone = clean_phone(first_value(f, [
-        "telephoneNumberToApply", "phoneNumberToApply", "applicationPhone",
-        "recruitmentPhone", "employerPhone", "telephoneNumber",
-        "phoneNumber", "telephone"
-    ]))
-    apply_url = clean_url(first_value(f, [
-        "websiteAddressToApply", "webAddressToApply", "applicationUrl",
-        "applicationURL", "applyUrl", "websiteUrl"
-    ]))
-
-    # Determine visa. DOL case numbers look like H-300-25123-456789 (H-2A)
-    # and H-400-25123-456789 (H-2B), so the "H-2A" text is often NOT in them.
-    all_text = " ".join(str(v) for v in f.values()).upper()
-    cn = case_no.upper()
-    if cn.startswith("H-400") or "H-2B" in cn or "9142B" in all_text or "H2B" in all_text:
-        visa = "H-2B"
-    elif cn.startswith("H-300") or "H-2A" in cn or "790A" in all_text or "9142A" in all_text or "H2A" in all_text:
-        visa = "H-2A"
-    else:
-        visa = ""
-
-    job_url = f"{SITE_BASE}/jobs/{quote(case_no)}" if case_no else ""
+    job_url = f"{SITE_BASE}/jobs/{quote(case_no)}" if case_no.startswith("H-") else ""
 
     return {
         "Visa": visa,
@@ -194,18 +255,32 @@ def record_to_row(rec):
         "DOL job link": job_url,
     }
 
-def make_dataframe(records):
-    rows = [record_to_row(r) for r in records]
+
+def _first_nonempty(series):
+    for x in series:
+        if x not in ("", None):
+            return x
+    return ""
+
+
+def make_dataframe(kind_records):
+    rows = [record_to_row(r, k) for k, r in kind_records]
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    # Remove rows that clearly aren't job orders.
     df = df[(df["Job title"] != "") | (df["Employer"] != "") | (df["Case number"] != "")]
-    return df.drop_duplicates(subset=["Case number", "Employer", "Job title"]).reset_index(drop=True)
+    cols = list(df.columns)
+    keyed = df[df["Case number"] != ""]
+    rest = df[df["Case number"] == ""].drop_duplicates(subset=["Employer", "Job title"])
+    # The same case can appear in two feeds; merge them, keeping any non-empty value.
+    merged = keyed.groupby("Case number", as_index=False, sort=False).agg(_first_nonempty)
+    return pd.concat([merged[cols], rest[cols]], ignore_index=True)
+
 
 def parse_wage(x):
     m = re.search(r"(\d+(?:\.\d+)?)", str(x))
     return float(m.group(1)) if m else None
+
 
 def get_detail_fallback(case_no):
     """Fetch a DOL job page when the feed omitted recruitment information."""
@@ -219,7 +294,6 @@ def get_detail_fallback(case_no):
         m = re.search(r'[\w.+-]+@[\w-]+\.[\w.-]+', html, re.I)
         if m:
             email = m.group(0)
-        # Prefer a US-style number.
         m = re.search(r'(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}', html)
         if m:
             phone = m.group(0)
@@ -227,13 +301,32 @@ def get_detail_fallback(case_no):
     except Exception:
         return "", ""
 
+
+def load_everything():
+    kind_records, debug, errors = [], [], []
+    for kind in FEEDS:
+        try:
+            content, url, used = load_latest_feed(kind)
+            recs, fname = parse_zip_json(content)
+            kind_records.extend((kind, r) for r in recs)
+            debug.append({
+                "feed": kind, "date": used, "url": url, "file": fname, "records": len(recs),
+                "keys": list(flatten(recs[0]).keys())[:80] if recs else [],
+            })
+        except Exception as e:
+            errors.append(f"{kind}: {e}")
+    if not kind_records:
+        raise RuntimeError("\n".join(errors) or "No records found in any feed.")
+    return kind_records, debug, errors
+
+
 st.title("🇺🇸 US Seasonal Jobs Finder")
 st.caption("Searches the U.S. Department of Labor SeasonalJobs.gov data feeds and surfaces recruitment contacts.")
 
 with st.sidebar:
     st.header("Filters")
     visa_filter = st.multiselect("Visa program", ["H-2A", "H-2B", "Unknown"], default=["H-2A", "H-2B", "Unknown"])
-    keyword = st.text_input("Keyword", placeholder="farmworker, harvest, construction…")
+    keyword = st.text_input("Keyword", placeholder="tile, construction, farm, harvest…")
     state_filter = st.text_input("State", placeholder="TX, WA, Idaho…")
     min_wage = st.number_input("Minimum hourly wage ($)", min_value=0.0, value=0.0, step=0.50)
     only_activeish = st.checkbox("Prefer jobs with future end dates", value=True)
@@ -246,30 +339,33 @@ with st.sidebar:
 
 if "df" not in st.session_state:
     st.session_state.df = None
-    st.session_state.feed_info = None
 
 if st.button("🔄 Refresh DOL jobs", type="primary", use_container_width=True):
     st.session_state.df = None
+    st.cache_data.clear()
 
 if st.session_state.df is None:
-    with st.spinner("Downloading the latest DOL job feed…"):
+    with st.spinner("Downloading the latest DOL job feeds (H-2A and H-2B)…"):
         try:
-            content, url, used_date = load_latest_feed("jo")
-            records, filename = parse_zip_json(content)
-            df = make_dataframe(records)
-            st.session_state.df = df
-            st.session_state.feed_info = (used_date, url, filename, len(records))
-            st.session_state.sample_keys = list(flatten(records[0]).keys())[:80] if records else []
+            kind_records, debug, errors = load_everything()
+            st.session_state.df = make_dataframe(kind_records)
+            st.session_state.debug = debug
+            st.session_state.errors = errors
+            st.session_state.raw_count = len(kind_records)
         except Exception as e:
-            st.error("The DOL feed could not be loaded.")
+            st.error("The DOL feeds could not be loaded.")
             st.code(str(e))
             st.stop()
 
-df = st.session_state.df.copy()
-used_date, feed_url, filename, raw_count = st.session_state.feed_info
+full = st.session_state.df
+df = full.copy()
+raw_count = st.session_state.raw_count
 
-# Enrich missing recruitment contacts lazily only for displayed rows.
-stages = [("Records read from feed", raw_count), ("Rows after cleaning", len(df))]
+for err in st.session_state.get("errors", []):
+    st.warning("A feed failed to load: " + err)
+
+stages = [("Records read from all feeds", raw_count), ("Jobs after cleaning & merging", len(df))]
+
 if visa_filter:
     df = df[df["Visa"].replace("", "Unknown").isin(visa_filter)]
 stages.append(("After visa filter", len(df)))
@@ -285,32 +381,38 @@ stages.append(("After keyword filter", len(df)))
 
 if state_filter:
     df = df[df["State"].str.lower().str.contains(state_filter.lower(), na=False)]
-
 stages.append(("After state filter", len(df)))
+
 df["WageNumeric"] = df["Wage"].map(parse_wage)
 if min_wage > 0:
     df = df[df["WageNumeric"].fillna(-1) >= min_wage]
-
 stages.append(("After wage filter", len(df)))
+
 if only_activeish:
     today = pd.Timestamp.today().normalize()
     parsed_end = pd.to_datetime(df["End"], errors="coerce")
     df = df[parsed_end.isna() | (parsed_end >= today)]
-
 stages.append(("After end-date filter", len(df)))
+
 if need_contact:
     df = df[(df["Application email"] != "") | (df["Application phone"] != "")]
 stages.append(("After contact filter", len(df)))
 
-with st.expander("🛠 Debug: why so few / zero jobs?"):
+with st.expander("🛠 Debug: what did the feeds contain?"):
     for name, n in stages:
         st.write(f"{name}: **{n:,}**")
-    full = st.session_state.df
-    st.write("Visa values found in feed:", full["Visa"].replace("", "Unknown").value_counts().to_dict())
-    st.write("Rows with email:", int((full["Application email"] != "").sum()),
-             "| with phone:", int((full["Application phone"] != "").sum()))
-    st.write("Sample field names in the first feed record:")
-    st.code("\n".join(st.session_state.get("sample_keys", [])))
+    st.write("Jobs per visa:", full["Visa"].replace("", "Unknown").value_counts().to_dict())
+    st.write(
+        "Jobs with email:", int((full["Application email"] != "").sum()),
+        "| with phone:", int((full["Application phone"] != "").sum()),
+        "| with job title:", int((full["Job title"] != "").sum()),
+        "| with employer:", int((full["Employer"] != "").sum()),
+        "| with state:", int((full["State"] != "").sum()),
+        "| with wage:", int((full["Wage"] != "").sum()),
+    )
+    for d in st.session_state.get("debug", []):
+        st.markdown(f"**Feed `{d['feed']}`** — file date {d['date']}, {d['records']:,} records")
+        st.code("\n".join(d["keys"]) or "(no records)")
     st.dataframe(full.head(5))
 
 df = df.sort_values(["WageNumeric", "Start"], ascending=[False, True], na_position="last")
@@ -321,21 +423,25 @@ c2.metric("Employers", df["Employer"].replace("", pd.NA).nunique())
 c3.metric("H-2A", int((df["Visa"] == "H-2A").sum()))
 c4.metric("H-2B", int((df["Visa"] == "H-2B").sum()))
 
+feed_dates = ", ".join(f"{d['feed']}: {d['date']}" for d in st.session_state.get("debug", []))
 st.info(
-    f"Feed date: **{used_date}** • Records read: **{raw_count:,}** • "
-    f"Source: U.S. Department of Labor. Visa badge means the DOL record is an H-2A/H-2B job order; "
+    f"Feed dates: **{feed_dates}** • Records read: **{raw_count:,}** • "
+    f"Source: U.S. Department of Labor. The visa badge means the DOL record is an H-2A/H-2B job order; "
     f"it does **not** by itself guarantee that a particular foreign applicant will receive a visa."
+)
+st.warning(
+    "⚠️ Scam warning: real H-2A/H-2B employers do NOT charge workers recruitment fees. "
+    "Never pay anyone for a job offer. Apply only through the contacts on the official DOL listing."
 )
 
 if df.empty:
-    st.warning("No jobs match the current filters.")
+    st.warning("No jobs match the current filters. Open the Debug section above to see where they were filtered out.")
     st.stop()
 
-# User-facing table
 display_cols = [
     "Visa", "Job title", "Employer", "City", "State", "Wage",
     "Start", "End", "Workers", "Application email", "Application phone",
-    "Case number", "DOL job link"
+    "Case number", "DOL job link",
 ]
 st.dataframe(
     df[display_cols],
@@ -343,24 +449,18 @@ st.dataframe(
     hide_index=True,
     column_config={
         "DOL job link": st.column_config.LinkColumn("DOL job", display_text="Open job"),
-        "Apply website": st.column_config.LinkColumn("Apply website"),
     },
 )
 
 st.subheader("Job details & application")
-selected_case = st.selectbox(
-    "Choose a job",
-    df["Case number"].tolist(),
-    format_func=lambda x: (
-        df.loc[df["Case number"] == x, "Job title"].iloc[0]
-        + " — "
-        + df.loc[df["Case number"] == x, "Employer"].iloc[0]
-    ),
-)
+case_options = df["Case number"].tolist()
+label_by_case = {
+    c: f"{(t or 'Job')} — {e}" for c, t, e in zip(df["Case number"], df["Job title"], df["Employer"])
+}
+selected_case = st.selectbox("Choose a job", case_options, format_func=lambda x: label_by_case.get(x, x))
 
 row = df[df["Case number"] == selected_case].iloc[0]
 
-# Fallback contact lookup if feed data omitted it.
 email = row["Application email"]
 phone = row["Application phone"]
 if not email or not phone:
@@ -419,16 +519,8 @@ st.download_button(
 
 with st.expander("How this app determines visa support"):
     st.write(
-        "H-2A is identified from the DOL agricultural job-order/application data; H-2B is identified "
-        "from the corresponding H-2B data. The app reports the program attached to the DOL record. "
-        "It does not claim that a worker is personally eligible, that an employer will sponsor a specific "
-        "applicant, or that a visa will be issued."
-    )
-
-with st.expander("Source and technical notes"):
-    st.write(f"Latest feed URL used: {feed_url}")
-    st.write(f"Archive member read: {filename}")
-    st.write(
-        "This app uses the public DOL data feed rather than scraping a search-results page. "
-        "That is more stable and is explicitly intended by DOL for third-party job-search sites."
+        "H-2A jobs come from the DOL 790/790A and 9142A feeds (farm work). H-2B jobs come from the "
+        "9142B feed (non-farm work such as construction, landscaping and hospitality). The app reports "
+        "the program attached to the DOL record. It does not claim that a worker is personally eligible, "
+        "that an employer will sponsor a specific applicant, or that a visa will be issued."
     )
