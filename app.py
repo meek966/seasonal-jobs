@@ -97,10 +97,12 @@ def first_value(flat, aliases):
     return ""
 
 def normalize_case_number(v):
+    """DOL job pages use the ETA case number, e.g. H-300-26265-251804.
+    The feed may give a job-order number like JO-A-300-26265-251804,
+    which the website says 'case not found' for. Rebuild the H- form."""
     s = str(v or "").strip()
-    # Keep the familiar H-2A/H-2B case format if present.
-    m = re.search(r"H-[0-9]+-[0-9A-Za-z-]+", s, re.I)
-    return m.group(0) if m else s
+    m = re.search(r"(\d{3})-(\d{5})-(\d{6})", s)
+    return f"H-{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else s
 
 def clean_phone(v):
     s = str(v or "").strip()
